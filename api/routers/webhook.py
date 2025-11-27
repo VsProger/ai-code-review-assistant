@@ -99,6 +99,7 @@ async def gitlab_webhook(
             sha=sha_info
         )
 
+
     # 7. Публикуем общий summary
     gitlab.post_summary_comment(
         project_id=project_id,

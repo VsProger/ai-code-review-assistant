@@ -62,9 +62,34 @@ class GitLabService:
             resp = client.put(url, headers=self.headers, data=data)
             resp.raise_for_status()
             return resp.json()
-    
-    def post_inline_comment(self, project_id, mr_iid, file_path, line, body, sha):
+        
+        
+    def post_inline_comment(
+        self,
+        project_id: int,
+        mr_iid: int,
+        file_path: str,
+        line_number: int,
+        body: str,
+        sha: dict
+    ):
+        """
+        Создаёт inline-комментарий для ДЕЙСТВИТЕЛЬНО существующих строк.
+        Игнорирует некорректные случаи, чтобы не ломать приложение.
+        """
+
+        # SHA должны существовать
+        if not sha.get("base_sha") or not sha.get("start_sha") or not sha.get("head_sha"):
+            print("⚠️ SKIP inline comment — missing SHA:", sha)
+            return None
+
+        # line_number должен быть >= 1
+        if not isinstance(line_number, int) or line_number < 1:
+            print("⚠️ SKIP inline comment — invalid line:", line_number)
+            return None
+
         url = f"{self.base_url}/projects/{project_id}/merge_requests/{mr_iid}/discussions"
+
         payload = {
             "body": body,
             "position": {
@@ -72,10 +97,19 @@ class GitLabService:
                 "start_sha": sha["start_sha"],
                 "head_sha": sha["head_sha"],
                 "new_path": file_path,
-                "new_line": line
+                "new_line": line_number
             }
         }
 
+        print("INLINE PAYLOAD:", payload)
+
         with httpx.Client(timeout=20) as client:
             resp = client.post(url, headers=self.headers, json=payload)
+
+            # Если GitLab всё ещё отвечает 400 → не ломаем приложение
+            if resp.status_code == 400:
+                print("❌ GitLab rejected inline comment:", resp.text)
+                return None
+
             resp.raise_for_status()
+            return resp.json()
