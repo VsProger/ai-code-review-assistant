@@ -1,115 +1,72 @@
-import httpx
-from typing import Any, Dict, List
+"""Merge-request operations expressed in GitLab's API."""
 
-from core.config import settings
+import logging
+from typing import Any, Dict, List, Optional
+
+from domain.models.merge_request import DiffSHAs
+from infrastructure.gitlab.gitlab_client import GitLabClient
+
+logger = logging.getLogger(__name__)
 
 
 class GitLabService:
-    def __init__(self):
-        self.base_url = settings.gitlab_base_url.rstrip("/")
-        self.headers = {
-            "PRIVATE-TOKEN": settings.gitlab_token,
-        }
+    def __init__(self, client: GitLabClient) -> None:
+        self.client = client
 
-    def get_merge_request(self, project_id: int, mr_iid: int) -> Dict[str, Any]:
-        url = f"{self.base_url}/projects/{project_id}/merge_requests/{mr_iid}"
-        with httpx.Client(timeout=15) as client:
-            resp = client.get(url, headers=self.headers)
-            resp.raise_for_status()
-            return resp.json()
+    def _mr_path(self, project_id: int, mr_iid: int) -> str:
+        return f"/projects/{project_id}/merge_requests/{mr_iid}"
 
-    def get_merge_request_changes(self, project_id: int, mr_iid: int) -> Dict[str, Any]:
-        """
-        Возвращает объект с ключом 'changes' — список изменений файлов.
-        """
-        url = f"{self.base_url}/projects/{project_id}/merge_requests/{mr_iid}/changes"
-        with httpx.Client(timeout=30) as client:
-            resp = client.get(url, headers=self.headers)
-            resp.raise_for_status()
-            return resp.json()
+    async def get_merge_request(self, project_id: int, mr_iid: int) -> Dict[str, Any]:
+        return await self.client.get(self._mr_path(project_id, mr_iid))
 
-    def post_summary_comment(self, project_id: int, mr_iid: int, body: str) -> Dict[str, Any]:
-        """
-        Создаёт обсуждение (discussion) с одним комментарием в MR.
-        """
-        url = f"{self.base_url}/projects/{project_id}/merge_requests/{mr_iid}/discussions"
-        payload = {
-            "body": body,
-        }
-        with httpx.Client(timeout=15) as client:
-            resp = client.post(url, headers=self.headers, json=payload)
-            resp.raise_for_status()
-            return resp.json()
+    async def get_merge_request_changes(self, project_id: int, mr_iid: int) -> Dict[str, Any]:
+        """Returns an object whose 'changes' key holds the per-file diffs."""
+        return await self.client.get(f"{self._mr_path(project_id, mr_iid)}/changes")
 
-    def add_label(self, project_id: int, mr_iid: int, label: str) -> Dict[str, Any]:
-        """
-        Добавляет label к MR, не теряя существующие.
-        """
-        mr = self.get_merge_request(project_id, mr_iid)
-        existing_labels: List[str] = mr.get("labels") or []
+    async def post_summary_comment(self, project_id: int, mr_iid: int,
+                                   body: str) -> Optional[Dict[str, Any]]:
+        return await self.client.post(
+            f"{self._mr_path(project_id, mr_iid)}/discussions", {"body": body}
+        )
 
-        if label in existing_labels:
-            return mr  # уже есть, ничего не делаем
-
-        new_labels = existing_labels + [label]
-        labels_str = ",".join(new_labels)
-
-        url = f"{self.base_url}/projects/{project_id}/merge_requests/{mr_iid}"
-        data = {
-            "labels": labels_str,
-        }
-        with httpx.Client(timeout=15) as client:
-            resp = client.put(url, headers=self.headers, data=data)
-            resp.raise_for_status()
-            return resp.json()
-        
-        
-    def post_inline_comment(
-        self,
-        project_id: int,
-        mr_iid: int,
-        file_path: str,
-        line_number: int,
-        body: str,
-        sha: dict
-    ):
+    async def post_inline_comment(self, project_id: int, mr_iid: int, file_path: str,
+                                  line_number: int, body: str,
+                                  sha: DiffSHAs) -> Optional[Dict[str, Any]]:
         """
-        Создаёт inline-комментарий для ДЕЙСТВИТЕЛЬНО существующих строк.
-        Игнорирует некорректные случаи, чтобы не ломать приложение.
-        """
+        Anchor a comment to one line of the diff.
 
-        # SHA должны существовать
-        if not sha.get("base_sha") or not sha.get("start_sha") or not sha.get("head_sha"):
-            print("⚠️ SKIP inline comment — missing SHA:", sha)
+        GitLab answers 400 when the position does not resolve to a line of the
+        diff -- a line the model invented, or a line in an unchanged region.
+        That is expected often enough that it is tolerated rather than raised.
+        """
+        if not sha.complete:
+            logger.warning("Skipping inline comment: incomplete SHAs for MR !%s", mr_iid)
             return None
-
-        # line_number должен быть >= 1
         if not isinstance(line_number, int) or line_number < 1:
-            print("⚠️ SKIP inline comment — invalid line:", line_number)
+            logger.warning("Skipping inline comment: invalid line %r", line_number)
             return None
-
-        url = f"{self.base_url}/projects/{project_id}/merge_requests/{mr_iid}/discussions"
 
         payload = {
             "body": body,
             "position": {
-                "base_sha": sha["base_sha"],
-                "start_sha": sha["start_sha"],
-                "head_sha": sha["head_sha"],
+                "position_type": "text",
+                "base_sha": sha.base_sha,
+                "start_sha": sha.start_sha,
+                "head_sha": sha.head_sha,
                 "new_path": file_path,
-                "new_line": line_number
-            }
+                "new_line": line_number,
+            },
         }
+        return await self.client.post(
+            f"{self._mr_path(project_id, mr_iid)}/discussions", payload, tolerate=(400, 404)
+        )
 
-        print("INLINE PAYLOAD:", payload)
-
-        with httpx.Client(timeout=20) as client:
-            resp = client.post(url, headers=self.headers, json=payload)
-
-            # Если GitLab всё ещё отвечает 400 → не ломаем приложение
-            if resp.status_code == 400:
-                print("❌ GitLab rejected inline comment:", resp.text)
-                return None
-
-            resp.raise_for_status()
-            return resp.json()
+    async def add_label(self, project_id: int, mr_iid: int, label: str) -> Dict[str, Any]:
+        """Add a label without dropping the ones already set."""
+        mr = await self.get_merge_request(project_id, mr_iid)
+        existing: List[str] = mr.get("labels") or []
+        if label in existing:
+            return mr
+        return await self.client.put(
+            self._mr_path(project_id, mr_iid), {"labels": ",".join(existing + [label])}
+        )

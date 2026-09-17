@@ -3,3 +3,7 @@ uvicorn
 httpx
 pydantic
 pydantic-settings
+
+# tests
+pytest
+pytest-asyncio
